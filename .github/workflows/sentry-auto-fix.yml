@@ -1,0 +1,106 @@
+name: Sentry Auto-Fix
+
+on:
+  repository_dispatch:
+    types: [sentry-issue]
+
+jobs:
+  auto-fix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL || 'anthropic/claude-sonnet-4' }}
+      SENTRY_ACCESS_TOKEN: ${{ secrets.SENTRY_ACCESS_TOKEN }}
+      SENTRY_HOST: ${{ vars.SENTRY_HOST || 'sentry.io' }}
+      SENTRY_ORG_SLUG: ${{ vars.SENTRY_ORG_SLUG }}
+      SENTRY_ISSUE_ID: ${{ github.event.client_payload.issue.issueId }}
+      SENTRY_ISSUE_TITLE: ${{ github.event.client_payload.issue.title }}
+      SENTRY_ISSUE_URL: ${{ github.event.client_payload.issue.permalink }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Validate payload
+        run: |
+          if [ -z "$SENTRY_ISSUE_ID" ]; then
+            echo "::error::client_payload.issue.issueId is missing"
+            exit 1
+          fi
+          if [ -z "$SENTRY_ORG_SLUG" ]; then
+            echo "::error::Repo variable SENTRY_ORG_SLUG is not set"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure git
+        run: |
+          git config user.name "sentry-auto-fix[bot]"
+          git config user.email "sentry-auto-fix@users.noreply.github.com"
+
+      - name: Run agent
+        run: node agent/sentry-fix-agent.mjs
+
+      - name: Inspect agent result
+        id: result
+        run: |
+          if [ ! -f agent-result.json ]; then
+            echo "::error::Agent did not produce agent-result.json"
+            exit 1
+          fi
+          BRANCH=$(jq -r '.branch_name' agent-result.json)
+          TITLE=$(jq -r '.pr_title' agent-result.json)
+          NO_CHANGE=$(jq -r '.no_change_reason // ""' agent-result.json)
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "no_change=$NO_CHANGE" >> "$GITHUB_OUTPUT"
+
+      - name: Check for changes
+        id: diff
+        run: |
+          # Exclude the agent's own output artifact from the change set.
+          git add -A -- ':!agent-result.json'
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip if no changes
+        if: steps.diff.outputs.has_changes != 'true'
+        run: |
+          echo "Agent produced no file changes. Reason: ${{ steps.result.outputs.no_change }}"
+          echo "Skipping PR creation."
+
+      - name: Create branch and commit
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          BRANCH="${{ steps.result.outputs.branch }}"
+          git checkout -b "$BRANCH"
+          git commit -m "${{ steps.result.outputs.title }}" -m "Automated fix from sentry-auto-fix agent. Sentry issue ${{ env.SENTRY_ISSUE_ID }}."
+          git push -u origin "$BRANCH"
+
+      - name: Open draft PR
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          jq -r '.pr_body' agent-result.json > /tmp/pr-body.md
+          gh pr create \
+            --draft \
+            --title "${{ steps.result.outputs.title }}" \
+            --body-file /tmp/pr-body.md \
+            --head "${{ steps.result.outputs.branch }}" \
+            --base "${{ github.event.repository.default_branch }}"
